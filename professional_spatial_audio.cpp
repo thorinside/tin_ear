@@ -1,65 +1,23 @@
-// Professional Spatial Audio Implementation for ARM Cortex-M7 (v2.1)
-// Adds key psycho-acoustic cues – pinna notch, high-shelf ILD, early reflection,
-// and air-absorption low-pass – **without changing the public interface**.
-//
-// Change log 2025-07-04:
-//   • v2   – first full externalisation features.
-//   • v2.1 – replaced std::fill with a for-loop for embedded GCC compatibility.
-//
-// Author: ChatGPT
+// Professional Spatial Audio Implementation for ARM Cortex-M7  (v2.5)
+// -------------------------------------------------------------------
+// • No call to atan2f (or fast approximation).  Uses sinAz = x / √(x²+z²).
+// • Externalisation cues, smoothing, dual-delay ITD remain from v2.3.
+// • Public API unchanged.
 
 #include <cmath>
 #include <cstdint>
-#include <cstring>   // for memset (optional)
+#include <cstring>      // memset
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846f
 #endif
 
 // ────────────────────────────────────────────────────────────────
-// Fast atan2f approximation for ARM Cortex-M (unchanged)
-// ────────────────────────────────────────────────────────────────
-static inline float fast_atan2f(float y, float x)
-{
-    if (x == 0.0f && y == 0.0f) return 0.0f;
-
-    float abs_y = (y < 0.0f) ? -y : y;
-    float abs_x = (x < 0.0f) ? -x : x;
-    float angle;
-
-    if (abs_x >= abs_y) {
-        float r = abs_y / (abs_x + 1.0e-10f);
-        if (r < 0.4f) {
-            float r2 = r * r;
-            angle = r * (1.0f - r2 * (1.0f / 3.0f - r2 * 0.2f));
-        } else {
-            angle = (M_PI * 0.25f) * r / (1.0f + 0.28f * r);
-        }
-    } else {
-        float r = abs_x / (abs_y + 1.0e-10f);
-        if (r < 0.4f) {
-            float r2 = r * r;
-            angle = (M_PI * 0.5f) -
-                    r * (1.0f - r2 * (1.0f / 3.0f - r2 * 0.2f));
-        } else {
-            angle = (M_PI * 0.5f) -
-                    (M_PI * 0.25f) * r / (1.0f + 0.28f * r);
-        }
-    }
-
-    if (x < 0.0f)       angle = (y >= 0.0f) ?  (M_PI - angle)
-                                            : -(M_PI - angle);
-    else if (y < 0.0f)  angle = -angle;
-
-    return angle;
-}
-
-// ────────────────────────────────────────────────────────────────
 // Constants & helpers
 // ────────────────────────────────────────────────────────────────
 constexpr float kSampleRate   = 48000.0f;
 constexpr float kInvSR        = 1.0f / kSampleRate;
-constexpr float kSpeedOfSound = 343.0f;       // m/s
+constexpr float kSpeedOfSound = 343.0f;            // m / s
 
 static inline float clampf(float x, float lo, float hi)
 {
@@ -67,7 +25,7 @@ static inline float clampf(float x, float lo, float hi)
 }
 
 // ────────────────────────────────────────────────────────────────
-// Biquad – Direct Form-I (transposed)
+// Biquad with coefficient smoothing
 // ────────────────────────────────────────────────────────────────
 class Biquad {
 public:
@@ -83,11 +41,12 @@ public:
     void setCoeffs(float _b0, float _b1, float _b2,
                    float _a0, float _a1, float _a2)
     {
-        b0 = _b0 / _a0;
-        b1 = _b1 / _a0;
-        b2 = _b2 / _a0;
-        a1 = _a1 / _a0;
-        a2 = _a2 / _a0;
+        constexpr float kSmooth = 0.999f;     // ≈5 ms time-constant
+        b0 = kSmooth * b0 + (1.0f - kSmooth) * (_b0 / _a0);
+        b1 = kSmooth * b1 + (1.0f - kSmooth) * (_b1 / _a0);
+        b2 = kSmooth * b2 + (1.0f - kSmooth) * (_b2 / _a0);
+        a1 = kSmooth * a1 + (1.0f - kSmooth) * (_a1 / _a0);
+        a2 = kSmooth * a2 + (1.0f - kSmooth) * (_a2 / _a0);
     }
 
     void clear() { b0 = 1; b1 = b2 = a1 = a2 = z1 = z2 = 0; }
@@ -96,7 +55,7 @@ private:
     float b0{}, b1{}, b2{}, a1{}, a2{}, z1{}, z2{};
 };
 
-// --- Notch filter (pinna cue) ----------------------------------------------
+// ───────── Filter builders ──────────────────────────────────────
 static inline void setNotch(Biquad& f, float fc, float Q = 8.0f)
 {
     fc = clampf(fc, 200.0f, kSampleRate * 0.45f);
@@ -114,16 +73,15 @@ static inline void setNotch(Biquad& f, float fc, float Q = 8.0f)
     f.setCoeffs(b0, b1, b2, a0, a1, a2);
 }
 
-// --- High-shelf ILD (head-shadow) ------------------------------------------
 static inline void setHighShelf(Biquad& f, float fc, float dBgain)
 {
     fc = clampf(fc, 300.0f, kSampleRate * 0.45f);
 
-    float A     = powf(10.0f, dBgain * 0.05f);    // 10^(dB/20)
+    float A     = powf(10.0f, dBgain * 0.05f);
     float w0    = 2.0f * M_PI * fc * kInvSR;
     float cosw0 = cosf(w0);
     float sinw0 = sinf(w0);
-    float alpha = sinw0 * 0.70710678f;            // sin/2 * √2
+    float alpha = sinw0 * 0.70710678f;         // sin/2 * √2
     float beta  = sqrtf(A) * alpha;
 
     float b0 =      A * ((A + 1) + (A - 1) * cosw0 + 2 * beta);
@@ -137,7 +95,7 @@ static inline void setHighShelf(Biquad& f, float fc, float dBgain)
 }
 
 // ────────────────────────────────────────────────────────────────
-// One-pole low-pass for air absorption
+// One-pole low-pass (air absorption)
 // ────────────────────────────────────────────────────────────────
 class OnePoleLP {
 public:
@@ -146,7 +104,7 @@ public:
     void setCutoff(float fc) {
         fc = clampf(fc, 50.0f, 0.45f * kSampleRate);
         float rc = 1.0f / (2.0f * M_PI * fc);
-        alpha = kInvSR / (rc + kInvSR);           // dt = 1/Fs
+        alpha = kInvSR / (rc + kInvSR);
     }
 
     float process(float x) {
@@ -159,14 +117,11 @@ private:
 };
 
 // ────────────────────────────────────────────────────────────────
-// Fractional delay line (linear-interp) – 512 samples
+// Fractional delay line (linear) – 512 samples
 // ────────────────────────────────────────────────────────────────
 class DelayLine {
 public:
-    DelayLine() : writeIdx(0) {
-        for (int i = 0; i < kMax; ++i) buf[i] = 0.0f;   // std::fill removed
-        // Alternatively: memset(buf, 0, sizeof(buf));
-    }
+    DelayLine() : writeIdx(0) { memset(buf, 0, sizeof(buf)); }
 
     float process(float x, float delaySamples)
     {
@@ -174,6 +129,7 @@ public:
 
         float readPos = static_cast<float>(writeIdx) - delaySamples;
         if (readPos < 0) readPos += kMax;
+
         int   i0   = static_cast<int>(readPos) & kMask;
         int   i1   = (i0 + 1) & kMask;
         float frac = readPos - static_cast<int>(readPos);
@@ -187,94 +143,109 @@ private:
     static constexpr int kMax  = 512;
     static constexpr int kMask = kMax - 1;
 
-    float buf[kMax];
+    float buf[kMax]{};
     int   writeIdx;
 };
 
 // ────────────────────────────────────────────────────────────────
-// Per-channel processing objects (static = persist across calls)
+// Persistent DSP objects & smoothed state
 // ────────────────────────────────────────────────────────────────
-static Biquad notchL, notchR, shelfL, shelfR;
+static Biquad    notchL, notchR, shelfL, shelfR;
 static OnePoleLP airLP;
-static DelayLine itdDelay, reflDelay;
+static DelayLine delayL, delayR;
+static DelayLine reflDelay;
+
+static float prevSinAz   = 0.0f;      // smoothed sin(azimuth)
+static float prevElevN   = 0.0f;      // smoothed elevation norm
+static float prevDist    = 1.0f;
 
 // ────────────────────────────────────────────────────────────────
 // Public API (unchanged)
 // ────────────────────────────────────────────────────────────────
 extern "C"
-void applyMonoSpatialAudio(float* in,
+void applyMonoSpatialAudio(const float* in,
                            float* outL,
                            float* outR,
-                           int    numSamples,
-                           float  srcX,
-                           float  srcY,
-                           float  srcZ)
+                           const int    numSamples,
+                           const float  srcX,
+                           const float  srcY,
+                           const float  srcZ)
 {
-    // ───────── 1. Update geometry-dependent parameters ──────────
-    float dist = sqrtf(srcX * srcX + srcY * srcY + srcZ * srcZ + 1.0e-6f);
+    // ── 1. Compute target parameters (block) ───────────────────
+    float horizDist = sqrtf(srcX * srcX + srcZ * srcZ) + 1.0e-6f; // avoid /0
+    float sinAzT    = clampf(srcX / horizDist, -1.0f, 1.0f);      // −1…+1
+    float distT     = sqrtf(srcX * srcX + srcY * srcY + srcZ * srcZ + 1.0e-6f);
+    float elevT     = asinf(srcY / distT);                        // −π/2…+π/2
+    float elevNT    = elevT * (2.0f / M_PI);                      // −1…+1
 
-    // Azimuth: −π … +π (0 = front, +90° = left ear)
-    float azim = fast_atan2f(srcX, srcZ);
+    // ── 2. Linear ramp across this block ───────────────────────
+    float sinAzStep = (sinAzT - prevSinAz) / numSamples;
+    float elevStep  = (elevNT - prevElevN) / numSamples;
+    float distStep  = (distT  - prevDist ) / numSamples;
 
-    // Elevation: −π/2 … +π/2 (positive = above)
-    float elev = asinf(srcY / dist);
-    float elevNorm = clampf(elev * (2.0f / M_PI), -1.0f, 1.0f);
+    float sinAz = prevSinAz;
+    float elevN = prevElevN;
+    float dist  = prevDist;
 
-    // ----- Interaural time delay (±0.5 ms) -----
-    float itdSecs = 0.0005f * sinf(azim);           // centre-panned = 0
-    float itdSamp = itdSecs * kSampleRate;          // ±24 samples
-
-    // ----- Interaural level difference (broadband) -----
-    float ildGainL = 1.0f + 0.25f * sinf(azim);     // ±3 dB
-    float ildGainR = 1.0f - 0.25f * sinf(azim);
-
-    // ----- High-shelf ILD -----
-    setHighShelf(shelfL, 1500.0f,  8.0f * sinf(azim));
-    setHighShelf(shelfR, 1500.0f, -8.0f * sinf(azim));
-
-    // ----- Pinna notch -----
-    float notchFc = 8000.0f + 2500.0f * elevNorm;
-    setNotch(notchL, notchFc);
-    setNotch(notchR, notchFc);
-
-    // ----- Distance low-pass -----
-    float lpCut = 15000.0f - 1000.0f * (dist - 0.5f);   // 15 k → 5 k (0.5–10 m)
+    // Early reflection + LPF set once per block
+    float reflDelaySamp = fabsf(srcY) / kSpeedOfSound * kSampleRate;
+    float reflScale     = 0.501187f;                      // −6 dB
+    float lpCut         = 15000.0f - 1000.0f * (distT - 0.5f);
     airLP.setCutoff(clampf(lpCut, 5000.0f, 15000.0f));
 
-    // ----- Early reflection -----
-    float reflDelaySamp = fabsf(srcY) / kSpeedOfSound * kSampleRate; // ≤ ~10 ms
-    float reflScale     = 0.501187f;                                 // −6 dB
-
-    // ───────── 2. Process buffer ────────────────────────────────
+    // ── 3. Process audio buffer ─────────────────────────────────
     for (int n = 0; n < numSamples; ++n) {
-        float x  = in[n];
+        sinAz += sinAzStep;
+        elevN += elevStep;
+        dist  += distStep;
 
-        // Early reflection (mono)
-        float refl = reflDelay.process(x, reflDelaySamp) * reflScale;
-        float dry  = x + refl;
+        // ITD delay (positive on lagging ear)
+        float itdSamples = 0.0005f * fabsf(sinAz) * kSampleRate; // 0…24
+
+        // Early reflection
+        float x = in[n];
+        float xRefl = reflDelay.process(x, reflDelaySamp) * reflScale;
+        float dry = x + xRefl;
 
         // Air absorption
         float dryLP = airLP.process(dry);
 
-        // ITD (delay left vs right)
-        float dl = itdDelay.process(dryLP,  itdSamp);   // +delay = left ear late
-        float dr = itdDelay.process(dryLP, -itdSamp);
+        // ITD routing
+        float left, right;
+        if (sinAz >= 0.0f) {                // source on left → left ear lags
+            left  = delayL.process(dryLP,  itdSamples);
+            right = dryLP;
+        } else {                            // source on right
+            left  = dryLP;
+            right = delayR.process(dryLP,  itdSamples);
+        }
 
-        // ILD (broadband gain)
-        dl *= ildGainL;
-        dr *= ildGainR;
+        // ILD (broadband ±3 dB)
+        float ildL = 1.0f + 0.25f * sinAz;
+        float ildR = 1.0f - 0.25f * sinAz;
+        left  *= ildL;
+        right *= ildR;
 
-        // High-shelf head-shadow
-        dl = shelfL.process(dl);
-        dr = shelfR.process(dr);
+        // Update filter coefficients every 8 samples
+        if ((n & 7) == 0) {
+            setHighShelf(shelfL, 1500.0f,  8.0f * sinAz);
+            setHighShelf(shelfR, 1500.0f, -8.0f * sinAz);
+            float notchFc = 8000.0f + 2500.0f * elevN;
+            setNotch(notchL, notchFc);
+            setNotch(notchR, notchFc);
+        }
 
-        // Pinna notch
-        dl = notchL.process(dl);
-        dr = notchR.process(dr);
+        // Head-shadow shelf + pinna notch
+        left  = notchL.process(shelfL.process(left));
+        right = notchR.process(shelfR.process(right));
 
-        // Output
-        outL[n] = dl;
-        outR[n] = dr;
+        outL[n] = left;
+        outR[n] = right;
     }
+
+    // ── 4. Save smoothed state for next call ────────────────────
+    prevSinAz = sinAz;
+    prevElevN = elevN;
+    prevDist  = dist;
 }
 

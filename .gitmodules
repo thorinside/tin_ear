@@ -4,6 +4,3 @@
 [submodule "libs/VISR"]
 	path = libs/VISR
 	url = https://github.com/s3a-spatialaudio/VISR
-[submodule "libs/steam-audio"]
-	path = libs/steam-audio
-	url = https://github.com/ValveSoftware/steam-audio
