@@ -3,11 +3,59 @@
 #include <new>
 #include <cstring>  // for memcpy
 
+// Include spatial audio definitions
+#include <cstring>  // for memset
+
+// Forward declarations for spatial audio classes
+class Biquad {
+public:
+    Biquad() { clear(); }
+    float process(float x);
+    void setCoeffs(float _b0, float _b1, float _b2, float _a0, float _a1, float _a2);
+    void clear() { b0 = 1; b1 = b2 = a1 = a2 = z1 = z2 = 0; }
+private:
+    float b0{}, b1{}, b2{}, a1{}, a2{}, z1{}, z2{};
+};
+
+class OnePoleLP {
+public:
+    OnePoleLP() : alpha(0.0f), y1(0.0f) {}
+    void setCutoff(float fc);
+    float process(float x);
+private:
+    float alpha, y1;
+};
+
+class DelayLine {
+public:
+    DelayLine() : writeIdx(0) { memset(buf, 0, sizeof(buf)); }
+    float process(float x, float delaySamples);
+private:
+    static constexpr int kMax = 512;
+    static constexpr int kMask = kMax - 1;
+    float buf[kMax]{};
+    int writeIdx;
+};
+
+// Per-emitter spatial audio state structure
+struct SpatialAudioState {
+    Biquad    notchL, notchR, shelfL, shelfR;
+    OnePoleLP airLP;
+    DelayLine delayL, delayR;
+    DelayLine reflDelay;
+    
+    float prevSinAz;      // smoothed sin(azimuth)
+    float prevElevN;      // smoothed elevation norm
+    float prevDist;
+    
+    SpatialAudioState() : prevSinAz(0.0f), prevElevN(0.0f), prevDist(1.0f) {}
+};
+
 // Professional spatial audio function declaration
 extern "C" {
 void applyMonoSpatialAudio(const float *input, float *outputL, float *outputR,
                            int numSamples, float sourceX, float sourceY,
-                           float sourceZ);
+                           float sourceZ, SpatialAudioState* state);
 }
 
 // Add missing constants
@@ -18,16 +66,61 @@ void applyMonoSpatialAudio(const float *input, float *outputL, float *outputR,
 // Maximum number of emitters supported
 constexpr int kMaxEmitters = 8;
 
+// Forward declarations
+static const char* const enumStringsAutoSpread[] = {
+    "Off",
+    "On"
+};
+
+static const _NT_parameter commonParameters[] = {
+    {.name = "Auto Spread",
+     .min = 0,
+     .max = 1,
+     .def = 0,
+     .unit = kNT_unitEnum,
+     .scaling = 0,
+     .enumStrings = enumStringsAutoSpread},
+};
+
+static const _NT_parameter routingParameters[] = {
+    {.name = "Output L", .min = 1, .max = 28, .def = 13, .unit = kNT_unitAudioOutput, .scaling = 0, .enumStrings = nullptr},
+    {.name = "Output L mode", .min = 0, .max = 1, .def = 0, .unit = kNT_unitOutputMode, .scaling = 0, .enumStrings = nullptr},
+    {.name = "Output R", .min = 1, .max = 28, .def = 14, .unit = kNT_unitAudioOutput, .scaling = 0, .enumStrings = nullptr},
+};
+
+static const _NT_parameter perEmitterParameters[] = {
+    {.name = "Input", .min = 1, .max = 28, .def = 1, .unit = kNT_unitAudioInput, .scaling = 0, .enumStrings = nullptr},
+    {.name = "Azimuth", .min = -180, .max = 180, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = nullptr},
+    {.name = "Elevation", .min = -90, .max = 90, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = nullptr},
+    {.name = "Distance", .min = 1, .max = 100, .def = 10, .unit = kNT_unitNone, .scaling = kNT_scaling10, .enumStrings = nullptr},
+    {.name = "Gain", .min = -60, .max = 0, .def = 0, .unit = kNT_unitDb, .scaling = 0, .enumStrings = nullptr},
+};
+
+static const char* const emitterPageNames[] = {
+    "Emitter 1", "Emitter 2", "Emitter 3", "Emitter 4",
+    "Emitter 5", "Emitter 6", "Emitter 7", "Emitter 8"
+};
+
+static const char* const emitterInputNames[] = {
+    "Emitter 1 Input", "Emitter 2 Input", "Emitter 3 Input", "Emitter 4 Input",
+    "Emitter 5 Input", "Emitter 6 Input", "Emitter 7 Input", "Emitter 8 Input"
+};
+
 // Common parameter indices
 enum {
-    kParamOutputL,
-    kParamOutputMode,
-    kParamOutputR,
     kParamAutoSpread,
     kNumCommonParameters,
 };
 
-// Per-emitter parameter indices (relative to emitter base)
+// Routing parameter indices
+enum {
+    kParamOutputL = kNumCommonParameters,
+    kParamOutputMode,
+    kParamOutputR,
+    kNumRoutingParameters = 3,
+};
+
+// Per-emitter parameter indices
 enum {
     kParamEmitterInput,
     kParamEmitterAzimuth,
@@ -37,65 +130,51 @@ enum {
     kNumPerEmitterParameters,
 };
 
+static const uint8_t commonParams[] = { kParamAutoSpread };
+static const uint8_t routingParams[] = { kParamOutputL, kParamOutputMode, kParamOutputR };
+
 struct tinEarAlgorithm : _NT_algorithm {
     tinEarAlgorithm(int32_t numEmitters_) 
         : _NT_algorithm(), numEmitters(numEmitters_) {
-        // Initialize page definitions
-        pagesDefs.numPages = 1 + numEmitters;  // Routing page + one page per emitter
+        pagesDefs.numPages = 2 + numEmitters;  // Common + Emitter pages + Routing page
         pagesDefs.pages = pageDefs;
         
         // Copy common parameters
         memcpy(parameterDefs, commonParameters, kNumCommonParameters * sizeof(_NT_parameter));
         
-        // Create per-emitter parameters
+        // Copy routing parameters
+        memcpy(parameterDefs + kNumCommonParameters, routingParameters, kNumRoutingParameters * sizeof(_NT_parameter));
+        
+        // Copy per-emitter parameters with custom input names
         for (int i = 0; i < numEmitters; ++i) {
-            int baseIdx = kNumCommonParameters + i * kNumPerEmitterParameters;
+            int baseIdx = kNumCommonParameters + kNumRoutingParameters + i * kNumPerEmitterParameters;
+            memcpy(parameterDefs + baseIdx, perEmitterParameters, kNumPerEmitterParameters * sizeof(_NT_parameter));
             
-            // Create parameter definitions for this emitter
-            parameterDefs[baseIdx + kParamEmitterInput] = {
-                .name = emitterInputNames[i],
-                .min = 1, .max = 28, .def = static_cast<int16_t>(1 + i),
-                .unit = kNT_unitNone, .scaling = 0, .enumStrings = nullptr
-            };
-            
-            parameterDefs[baseIdx + kParamEmitterAzimuth] = {
-                .name = emitterAzimuthNames[i],
-                .min = -180, .max = 180, .def = 0,
-                .unit = kNT_unitNone, .scaling = 0, .enumStrings = nullptr
-            };
-            
-            parameterDefs[baseIdx + kParamEmitterElevation] = {
-                .name = emitterElevationNames[i],
-                .min = -90, .max = 90, .def = 0,
-                .unit = kNT_unitNone, .scaling = 0, .enumStrings = nullptr
-            };
-            
-            parameterDefs[baseIdx + kParamEmitterDistance] = {
-                .name = emitterDistanceNames[i],
-                .min = 1, .max = 100, .def = 10,
-                .unit = kNT_unitNone, .scaling = kNT_scaling10, .enumStrings = nullptr
-            };
-            
-            parameterDefs[baseIdx + kParamEmitterAttenuation] = {
-                .name = emitterAttenuationNames[i],
-                .min = -60, .max = 0, .def = 0,
-                .unit = kNT_unitDb, .scaling = 0, .enumStrings = nullptr
-            };
-            
-            // Create page for this emitter
-            pageDefs[i].name = emitterPageNames[i];
-            pageDefs[i].numParams = kNumPerEmitterParameters;
+            // Customize the input parameter name for this emitter
+            parameterDefs[baseIdx + kParamEmitterInput].name = emitterInputNames[i];
+            parameterDefs[baseIdx + kParamEmitterInput].def = static_cast<int16_t>(1 + i);
+        }
+        
+        // Create Common page (page 0)
+        pageDefs[0].name = "Common";
+        pageDefs[0].numParams = kNumCommonParameters;
+        pageDefs[0].params = commonParams;
+        
+        // Create emitter pages (pages 1 to numEmitters)
+        for (int i = 0; i < numEmitters; ++i) {
+            pageDefs[i + 1].name = emitterPageNames[i];
+            pageDefs[i + 1].numParams = kNumPerEmitterParameters;
             uint8_t* p = pageParams + i * kNumPerEmitterParameters;
-            pageDefs[i].params = p;
+            pageDefs[i + 1].params = p;
             for (int j = 0; j < kNumPerEmitterParameters; ++j) {
-                p[j] = baseIdx + j;
+                p[j] = kNumCommonParameters + kNumRoutingParameters + i * kNumPerEmitterParameters + j;
             }
         }
         
-        // Create routing page
-        pageDefs[numEmitters].name = "Routing";
-        pageDefs[numEmitters].numParams = kNumCommonParameters;
-        pageDefs[numEmitters].params = routingParams;
+        // Create routing page (last page)
+        pageDefs[numEmitters + 1].name = "Routing";
+        pageDefs[numEmitters + 1].numParams = kNumRoutingParameters;
+        pageDefs[numEmitters + 1].params = routingParams;
         
         // Set algorithm members
         parameters = parameterDefs;
@@ -125,6 +204,9 @@ struct tinEarAlgorithm : _NT_algorithm {
     // Auto-spread enabled flag
     bool autoSpreadEnabled = false;
 
+    // Per-emitter spatial audio state (allocated in DTC memory)
+    SpatialAudioState* spatialStates = nullptr;
+
     // Slew limiting - smooth over approximately 20ms at 48kHz
     static constexpr float SLEW_RATE = 0.001f;
 
@@ -134,20 +216,11 @@ struct tinEarAlgorithm : _NT_algorithm {
     float tempOutputR[MAX_BUFFER_SIZE]{};
     
     // Dynamic parameter storage
-    _NT_parameter parameterDefs[kNumCommonParameters + kMaxEmitters * kNumPerEmitterParameters];
+    _NT_parameter parameterDefs[kNumCommonParameters + kNumRoutingParameters + kMaxEmitters * kNumPerEmitterParameters];
     _NT_parameterPages pagesDefs;
-    _NT_parameterPage pageDefs[1 + kMaxEmitters];  // Routing + emitter pages
+    _NT_parameterPage pageDefs[2 + kMaxEmitters];  // Common + Emitter pages + Routing
     uint8_t pageParams[kMaxEmitters * kNumPerEmitterParameters];
     
-    // Static parameter names
-    static const char* emitterPageNames[kMaxEmitters];
-    static const char* emitterInputNames[kMaxEmitters];
-    static const char* emitterAzimuthNames[kMaxEmitters];
-    static const char* emitterElevationNames[kMaxEmitters];
-    static const char* emitterDistanceNames[kMaxEmitters];
-    static const char* emitterAttenuationNames[kMaxEmitters];
-    static const _NT_parameter commonParameters[kNumCommonParameters];
-    static const uint8_t routingParams[kNumCommonParameters];
 
     // Slew limiting function
     static float slewLimit(float current, float target, float rate) {
@@ -166,67 +239,15 @@ struct tinEarAlgorithm : _NT_algorithm {
     }
 };
 
-// Static member definitions
-static const char* const enumStringsAutoSpread[] = {
-    "Off",
-    "On"
-};
-
-const char* tinEarAlgorithm::emitterPageNames[kMaxEmitters] = {
-    "Emitter 1", "Emitter 2", "Emitter 3", "Emitter 4",
-    "Emitter 5", "Emitter 6", "Emitter 7", "Emitter 8"
-};
-
-const char* tinEarAlgorithm::emitterInputNames[kMaxEmitters] = {
-    "Input 1", "Input 2", "Input 3", "Input 4",
-    "Input 5", "Input 6", "Input 7", "Input 8"
-};
-
-const char* tinEarAlgorithm::emitterAzimuthNames[kMaxEmitters] = {
-    "Azimuth 1", "Azimuth 2", "Azimuth 3", "Azimuth 4",
-    "Azimuth 5", "Azimuth 6", "Azimuth 7", "Azimuth 8"
-};
-
-const char* tinEarAlgorithm::emitterElevationNames[kMaxEmitters] = {
-    "Elevation 1", "Elevation 2", "Elevation 3", "Elevation 4",
-    "Elevation 5", "Elevation 6", "Elevation 7", "Elevation 8"
-};
-
-const char* tinEarAlgorithm::emitterDistanceNames[kMaxEmitters] = {
-    "Distance 1", "Distance 2", "Distance 3", "Distance 4",
-    "Distance 5", "Distance 6", "Distance 7", "Distance 8"
-};
-
-const char* tinEarAlgorithm::emitterAttenuationNames[kMaxEmitters] = {
-    "Atten 1", "Atten 2", "Atten 3", "Atten 4",
-    "Atten 5", "Atten 6", "Atten 7", "Atten 8"
-};
-
-// clang-format off
-const _NT_parameter tinEarAlgorithm::commonParameters[kNumCommonParameters] = {
-    NT_PARAMETER_AUDIO_OUTPUT_WITH_MODE("Output L", 1, 13)
-    NT_PARAMETER_AUDIO_OUTPUT("Output R", 1, 14)
-    {.name = "Auto-Spread",
-     .min = 0,
-     .max = 1,
-     .def = 0,
-     .unit = kNT_unitEnum,
-     .scaling = 0,
-     .enumStrings = enumStringsAutoSpread},
-};
-// clang-format on
-const uint8_t tinEarAlgorithm::routingParams[kNumCommonParameters] = {
-    kParamOutputL, kParamOutputMode, kParamOutputR, kParamAutoSpread
-};
 
 void calculateRequirements(_NT_algorithmRequirements &req,
                            const int32_t *specifications) {
     int32_t numEmitters = specifications[0];
     
-    req.numParameters = kNumCommonParameters + numEmitters * kNumPerEmitterParameters;
+    req.numParameters = kNumCommonParameters + kNumRoutingParameters + numEmitters * kNumPerEmitterParameters;
     req.sram = sizeof(tinEarAlgorithm);
     req.dram = 0;
-    req.dtc = 0;
+    req.dtc = numEmitters * sizeof(SpatialAudioState);  // Allocate per-emitter spatial audio state
     req.itc = 0;
 }
 
@@ -236,6 +257,15 @@ _NT_algorithm *construct(const _NT_algorithmMemoryPtrs &ptrs,
     int32_t numEmitters = specifications[0];
     
     auto *alg = new(ptrs.sram) tinEarAlgorithm(numEmitters);
+    
+    // Initialize per-emitter spatial audio states in DTC memory
+    if (ptrs.dtc && numEmitters > 0) {
+        alg->spatialStates = reinterpret_cast<SpatialAudioState*>(ptrs.dtc);
+        for (int i = 0; i < numEmitters; ++i) {
+            new(&alg->spatialStates[i]) SpatialAudioState();
+        }
+    }
+    
     return alg;
 }
 
@@ -256,13 +286,17 @@ void parameterChanged(_NT_algorithm *self, int p) {
     }
     
     // Handle per-emitter parameters
-    if (p >= kNumCommonParameters) {
-        int relativeIdx = p - kNumCommonParameters;
+    if (p >= kNumCommonParameters + kNumRoutingParameters) {
+        int relativeIdx = p - (kNumCommonParameters + kNumRoutingParameters);
         int emitterIdx = relativeIdx / kNumPerEmitterParameters;
         int paramType = relativeIdx % kNumPerEmitterParameters;
         
         if (emitterIdx < pThis->numEmitters) {
             switch (paramType) {
+                case kParamEmitterInput:
+                    // Input parameter - no action needed
+                    break;
+                    
                 case kParamEmitterAzimuth:
                     if (!pThis->autoSpreadEnabled) {
                         pThis->targetAzimuth[emitterIdx] = 
@@ -336,7 +370,7 @@ void step(_NT_algorithm *self, float *busFrames, int numFramesBy4) {
         pThis->sourceY[emitter] = distance * sinf(pThis->currentElevation[emitter]);
         
         // Get input for this emitter
-        int inputBusIdx = kNumCommonParameters + emitter * kNumPerEmitterParameters + kParamEmitterInput;
+        int inputBusIdx = kNumCommonParameters + kNumRoutingParameters + emitter * kNumPerEmitterParameters + kParamEmitterInput;
         const float *input = busFrames + (pThis->v[inputBusIdx] - 1) * numFrames;
         
         // Calculate linear gain from dB attenuation
@@ -355,7 +389,8 @@ void step(_NT_algorithm *self, float *busFrames, int numFramesBy4) {
                                   currentFrames, 
                                   pThis->sourceX[emitter],
                                   pThis->sourceY[emitter], 
-                                  pThis->sourceZ[emitter]);
+                                  pThis->sourceZ[emitter],
+                                  &pThis->spatialStates[emitter]);
 
             // Mix this emitter's output to the main output with attenuation
             for (int i = 0; i < currentFrames; ++i) {

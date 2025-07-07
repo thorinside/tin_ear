@@ -148,19 +148,23 @@ private:
 };
 
 // ────────────────────────────────────────────────────────────────
-// Persistent DSP objects & smoothed state
+// Per-emitter spatial audio state structure
 // ────────────────────────────────────────────────────────────────
-static Biquad    notchL, notchR, shelfL, shelfR;
-static OnePoleLP airLP;
-static DelayLine delayL, delayR;
-static DelayLine reflDelay;
-
-static float prevSinAz   = 0.0f;      // smoothed sin(azimuth)
-static float prevElevN   = 0.0f;      // smoothed elevation norm
-static float prevDist    = 1.0f;
+struct SpatialAudioState {
+    Biquad    notchL, notchR, shelfL, shelfR;
+    OnePoleLP airLP;
+    DelayLine delayL, delayR;
+    DelayLine reflDelay;
+    
+    float prevSinAz;      // smoothed sin(azimuth)
+    float prevElevN;      // smoothed elevation norm
+    float prevDist;
+    
+    SpatialAudioState() : prevSinAz(0.0f), prevElevN(0.0f), prevDist(1.0f) {}
+};
 
 // ────────────────────────────────────────────────────────────────
-// Public API (unchanged)
+// Public API (modified to accept per-emitter state)
 // ────────────────────────────────────────────────────────────────
 extern "C"
 void applyMonoSpatialAudio(const float* in,
@@ -169,7 +173,8 @@ void applyMonoSpatialAudio(const float* in,
                            const int    numSamples,
                            const float  srcX,
                            const float  srcY,
-                           const float  srcZ)
+                           const float  srcZ,
+                           SpatialAudioState* state)
 {
     // ── 1. Compute target parameters (block) ───────────────────
     float horizDist = sqrtf(srcX * srcX + srcZ * srcZ) + 1.0e-6f; // avoid /0
@@ -179,19 +184,19 @@ void applyMonoSpatialAudio(const float* in,
     float elevNT    = elevT * (2.0f / M_PI);                      // −1…+1
 
     // ── 2. Linear ramp across this block ───────────────────────
-    float sinAzStep = (sinAzT - prevSinAz) / numSamples;
-    float elevStep  = (elevNT - prevElevN) / numSamples;
-    float distStep  = (distT  - prevDist ) / numSamples;
+    float sinAzStep = (sinAzT - state->prevSinAz) / numSamples;
+    float elevStep  = (elevNT - state->prevElevN) / numSamples;
+    float distStep  = (distT  - state->prevDist ) / numSamples;
 
-    float sinAz = prevSinAz;
-    float elevN = prevElevN;
-    float dist  = prevDist;
+    float sinAz = state->prevSinAz;
+    float elevN = state->prevElevN;
+    float dist  = state->prevDist;
 
     // Early reflection + LPF set once per block
     float reflDelaySamp = fabsf(srcY) / kSpeedOfSound * kSampleRate;
     float reflScale     = 0.501187f;                      // −6 dB
     float lpCut         = 15000.0f - 1000.0f * (distT - 0.5f);
-    airLP.setCutoff(clampf(lpCut, 5000.0f, 15000.0f));
+    state->airLP.setCutoff(clampf(lpCut, 5000.0f, 15000.0f));
 
     // ── 3. Process audio buffer ─────────────────────────────────
     for (int n = 0; n < numSamples; ++n) {
@@ -204,20 +209,20 @@ void applyMonoSpatialAudio(const float* in,
 
         // Early reflection
         float x = in[n];
-        float xRefl = reflDelay.process(x, reflDelaySamp) * reflScale;
+        float xRefl = state->reflDelay.process(x, reflDelaySamp) * reflScale;
         float dry = x + xRefl;
 
         // Air absorption
-        float dryLP = airLP.process(dry);
+        float dryLP = state->airLP.process(dry);
 
         // ITD routing
         float left, right;
         if (sinAz >= 0.0f) {                // source on left → left ear lags
-            left  = delayL.process(dryLP,  itdSamples);
+            left  = state->delayL.process(dryLP,  itdSamples);
             right = dryLP;
         } else {                            // source on right
             left  = dryLP;
-            right = delayR.process(dryLP,  itdSamples);
+            right = state->delayR.process(dryLP,  itdSamples);
         }
 
         // ILD (broadband ±3 dB)
@@ -228,24 +233,24 @@ void applyMonoSpatialAudio(const float* in,
 
         // Update filter coefficients every 8 samples
         if ((n & 7) == 0) {
-            setHighShelf(shelfL, 1500.0f,  8.0f * sinAz);
-            setHighShelf(shelfR, 1500.0f, -8.0f * sinAz);
+            setHighShelf(state->shelfL, 1500.0f,  8.0f * sinAz);
+            setHighShelf(state->shelfR, 1500.0f, -8.0f * sinAz);
             float notchFc = 8000.0f + 2500.0f * elevN;
-            setNotch(notchL, notchFc);
-            setNotch(notchR, notchFc);
+            setNotch(state->notchL, notchFc);
+            setNotch(state->notchR, notchFc);
         }
 
         // Head-shadow shelf + pinna notch
-        left  = notchL.process(shelfL.process(left));
-        right = notchR.process(shelfR.process(right));
+        left  = state->notchL.process(state->shelfL.process(left));
+        right = state->notchR.process(state->shelfR.process(right));
 
         outL[n] = left;
         outR[n] = right;
     }
 
     // ── 4. Save smoothed state for next call ────────────────────
-    prevSinAz = sinAz;
-    prevElevN = elevN;
-    prevDist  = dist;
+    state->prevSinAz = sinAz;
+    state->prevElevN = elevN;
+    state->prevDist  = dist;
 }
 
