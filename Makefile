@@ -30,9 +30,28 @@ CXXFLAGS := -std=c++14 \
 # Default target
 all: $(plugin_binary)
 
+# Native host build for nt_emu / VCV Rack (not part of the hardware build)
+HOST_CXX ?= clang++
+HOST_OS := $(shell uname -s)
+ifeq ($(HOST_OS),Darwin)
+	HOST_DYLIB_EXT := dylib
+	HOST_DYLIB_LDFLAGS := -dynamiclib -undefined dynamic_lookup
+else
+	HOST_DYLIB_EXT := so
+	HOST_DYLIB_LDFLAGS := -shared
+endif
+HOST_DYLIB := plugins/th_tinear_plugin.$(HOST_DYLIB_EXT)
+HOST_CXXFLAGS := -std=c++14 -fPIC -Os -Wall -fno-rtti -fno-exceptions -I$(INCLUDE_PATH)
+
+dylib: $(HOST_DYLIB)
+
+$(HOST_DYLIB): $(srcs) | plugins
+	$(HOST_CXX) $(HOST_CXXFLAGS) $(HOST_DYLIB_LDFLAGS) -o $@ $(srcs)
+	@echo "Built host plugin: $@"
+
 # Clean target
 clean:
-	rm -f $(outputs) $(plugin_binary)
+	rm -f $(outputs) $(plugin_binary) $(HOST_DYLIB)
 
 # Rule to create the plugins directory
 $(outputs): | plugins
@@ -50,4 +69,4 @@ $(plugin_binary): $(outputs)
 	arm-none-eabi-ld -r -o $@ $(outputs)
 	@echo "Plugin binary created: $@"
 
-.PHONY: all clean
+.PHONY: all clean dylib
